@@ -95,12 +95,12 @@ func dateAndTime(path string) (time.Time,error) {
 
 	x, err := exif.Decode(f)
 	if err != nil {
-		return time.Time{},err
-	}
-
-	date,err := x.DateTime()
-	if err == nil {
-		return date,nil
+		log.Printf("could not detect exif date/time: %s",err)
+	}else {
+		date,err := x.DateTime()
+		if err == nil {
+			return date,nil
+		}
 	}
 
 	ts,err := times.Stat(path)
