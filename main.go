@@ -1,114 +1,176 @@
 package main
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/xor-gate/goexif2/exif"
-	"gopkg.in/djherbis/times.v1"
+	"github.com/mostlygeek/go-exiftool"
 	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
-var src = flag.String("src","", "src to recursively scan for files")
+var src = flag.String("src", "", "src to recursively scan for files")
 var dst = flag.String("dst", "", "dst to copy files to")
+
+var threads = flag.Int("workers", runtime.NumCPU(), "number of worker threads")
+var wg sync.WaitGroup
+var workChan = make(chan func() error)
+
+var pool *exiftool.Pool
+
+var exifFlags = []string{
+	"-j",
+	"-CreateDate",
+	"-DateTime",
+	"-DateTimeOriginal",
+	"-ModifyDate",
+	"-FileModifyDate",
+}
 
 func main() {
 	flag.Parse()
 
-	if *src == "" || *dst == ""{
+	var err error
+	pool, err = exiftool.NewPool("exiftool", *threads, exifFlags...)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if *src == "" || *dst == "" {
 		flag.PrintDefaults()
 		return
 	}
 
-	err := filepath.Walk(*src, func(path string, info os.FileInfo, err error) error {
-		if info == nil || info.IsDir(){
-			log.Printf("found directory %s",path)
+	for i := 0; i < *threads; i++ {
+		go func() {
+			for f := range workChan {
+				err := f()
+				if err != nil {
+					log.Fatal(err)
+				}
+				wg.Done()
+			}
+		}()
+	}
+
+	_ = filepath.Walk(*src, func(path string, info os.FileInfo, err error) error {
+		wg.Add(1)
+		workChan <- work(path, info)
+		return nil
+	})
+
+	wg.Wait()
+
+}
+
+func work(path string, info os.FileInfo) func() error {
+	return func() error {
+		if info == nil || info.IsDir() {
+			log.Printf("found directory %s", path)
 			return nil
 		}
-		log.Printf("found file %s",path)
+		log.Printf("found file %s", path)
 
-		date,err := dateAndTime(path)
+		date, err := dateAndTime(path)
 		if err != nil {
 			return err
 		}
-		log.Printf("guessed date %s on %s",date.Format("2006/01/02"),path)
+		log.Printf("guessed date %s on %s", date.Format("2006/01/02"), path)
 
-		return copy(path,fmt.Sprintf("%s%s",filepath.Join(*dst,date.Format("2006/01/02150405")),strings.ToLower(filepath.Ext(path))))
-	})
-	if err != nil {
-		log.Fatal(err)
+		return copy(path, fmt.Sprintf("%s%s", filepath.Join(*dst, date.Format("2006/01/02150405")), strings.ToLower(filepath.Ext(path))))
 	}
+
 }
 
-func copy(src,dst string) error{
-	info,err := os.Stat(src)
-	if err != nil{
+func copy(src, dst string) error {
+	info, err := os.Stat(src)
+	if err != nil {
 		return err
 	}
-	dstInfo,err  := os.Stat(dst)
+	dstInfo, err := os.Stat(dst)
 	if err == nil {
 		if dstInfo.Size() != info.Size() {
-			log.Printf("%s already exists, but integrity check failed",dst)
+			log.Printf("%s already exists, but integrity check failed", dst)
 			if err := os.Remove(dst); err != nil {
 				return err
 			}
-			return copy(src,dst)
+			return copy(src, dst)
 		}
-		log.Printf("%s already exists, no copy required",dst)
+		log.Printf("%s already exists, no copy required", dst)
 		return nil
 	}
 
-	if !os.IsNotExist(err){
+	if !os.IsNotExist(err) {
 		return err
 	}
 
-	log.Printf("reading file %s",src)
+	log.Printf("reading file %s", src)
 	input, err := ioutil.ReadFile(src)
 	if err != nil {
 		return err
 	}
 
-
-	if err := os.MkdirAll(filepath.Dir(dst),0744); err != nil {
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
 		return err
 	}
 
-	log.Printf("copying %s to %s",src,dst)
+	log.Printf("copying %s to %s", src, dst)
 	err = ioutil.WriteFile(dst, input, 0644)
 	if err != nil {
 		return err
 	}
 
-	return os.Chtimes(dst,time.Now(),info.ModTime())
+	return os.Chtimes(dst, time.Now(), info.ModTime())
 }
 
-func dateAndTime(path string) (time.Time,error) {
-	f,err := os.Open(path)
+type exifdateset struct {
+	SourceFile     string
+	CreateDate     string
+	ModifyDate     string
+	FileModifyDate string
+}
+
+func (e exifdateset) Time() (time.Time, error) {
+	var t string
+	if e.CreateDate != "" {
+		t = e.CreateDate
+	} else if e.ModifyDate != "" {
+		t = e.ModifyDate
+	} else {
+		t = e.FileModifyDate
+	}
+
+	for _, l := range []string{"2006:01:02 15:04:05Z07:00", "2006:01:02 15:04:05"} {
+		parsed, err := time.Parse(l, t)
+		if err != nil {
+			continue
+		}
+		return parsed, nil
+	}
+	return time.Time{}, fmt.Errorf("could not parse time %s", t)
+}
+
+func dateAndTime(path string) (time.Time, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return time.Time{},err
+		return time.Time{}, err
 	}
 	defer f.Close()
 
-	x, err := exif.Decode(f)
+	data, err := pool.Extract(path)
 	if err != nil {
-		log.Printf("could not detect exif date/time: %s",err)
-	}else {
-		date,err := x.DateTime()
-		if err == nil {
-			return date,nil
-		}
+		log.Printf("could not detect exiftool tags: %s", err)
 	}
 
-	ts,err := times.Stat(path)
-	if err != nil {
-		return time.Time{},err
+	var dates []exifdateset
+	if err := json.Unmarshal(data, &dates); err != nil {
+		return time.Time{}, err
 	}
-	if ts.HasBirthTime(){
-		return ts.BirthTime(),nil
-	}
-	return ts.ModTime(),nil
+	return dates[0].Time()
 }
