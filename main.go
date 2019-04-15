@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/md5"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -26,6 +27,7 @@ var pool *exiftool.Pool
 
 var exifFlags = []string{
 	"-j",
+	"-DateAquired",
 	"-CreateDate",
 	"-DateTime",
 	"-DateTimeOriginal",
@@ -83,30 +85,14 @@ func work(path string, info os.FileInfo) func() error {
 		}
 		log.Printf("guessed date %s on %s", date.Format("2006/01/02"), path)
 
-		return copy(path, fmt.Sprintf("%s%s", filepath.Join(*dst, date.Format("2006/01/02150405")), strings.ToLower(filepath.Ext(path))))
+		return copy(path, *dst, date)
 	}
 
 }
 
-func copy(src, dst string) error {
+func copy(src, dstPath string, date time.Time) error {
 	info, err := os.Stat(src)
 	if err != nil {
-		return err
-	}
-	dstInfo, err := os.Stat(dst)
-	if err == nil {
-		if dstInfo.Size() != info.Size() {
-			log.Printf("%s already exists, but integrity check failed", dst)
-			if err := os.Remove(dst); err != nil {
-				return err
-			}
-			return copy(src, dst)
-		}
-		log.Printf("%s already exists, no copy required", dst)
-		return nil
-	}
-
-	if !os.IsNotExist(err) {
 		return err
 	}
 
@@ -116,17 +102,36 @@ func copy(src, dst string) error {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+	dstFile := fmt.Sprintf("%s_%x%s", filepath.Join(dstPath, date.Format("2006/01/02150405")), md5.Sum(input),strings.ToLower(filepath.Ext(src)))
+
+	dstInfo, err := os.Stat(dstFile)
+	if err == nil {
+		if dstInfo.Size() != info.Size() {
+			log.Printf("%s already exists, but integrity check failed", dstFile)
+			if err := os.Remove(dstFile); err != nil {
+				return err
+			}
+			return copy(src, dstPath, date)
+		}
+		log.Printf("%s already exists, no copy required", dstFile)
+		return nil
+	}
+
+	if !os.IsNotExist(err) {
 		return err
 	}
 
-	log.Printf("copying %s to %s", src, dst)
-	err = ioutil.WriteFile(dst, input, 0644)
+	if err := os.MkdirAll(filepath.Dir(dstFile), 0755); err != nil {
+		return err
+	}
+
+	log.Printf("copying %s to %s", src, dstFile)
+	err = ioutil.WriteFile(dstFile, input, 0644)
 	if err != nil {
 		return err
 	}
 
-	return os.Chtimes(dst, time.Now(), info.ModTime())
+	return os.Chtimes(dstFile, time.Now(), info.ModTime())
 }
 
 type exifdateset struct {
